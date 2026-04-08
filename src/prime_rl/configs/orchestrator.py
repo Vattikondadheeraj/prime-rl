@@ -291,9 +291,35 @@ class EnvConfig(BaseConfig):
         int,
         Field(
             ge=0,
-            description="Maximum number of times the environment will retry a failed rollout.",
+            description="Maximum number of times the scheduler will retry a failed rollout group. "
+            "Covers transient failures (e.g. ConnectTimeout during weight broadcast). "
+            "Set low to avoid infinite retry loops on systematic failures (e.g. context overflow).",
         ),
-    ] = 0
+    ] = 3
+
+    # Co-training overrides: when co_training=True, each agent can use a different base model
+    # and/or inference server. If set, these override the top-level model.name and client config
+    # for this agent's inference pool and weight broadcast.
+    model_name: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Co-training only: override the base model name for this agent's inference server. "
+                "If None, falls back to the top-level model.name. "
+                "Use this when running two different base models for platform and user agents."
+            ),
+        ),
+    ] = None
+    client: Annotated[
+        ClientConfig | None,
+        Field(
+            description=(
+                "Co-training only: override the inference client (vLLM server URL) for this agent. "
+                "If None, falls back to the top-level client config (shared vLLM server). "
+                "Set this when each agent has its own dedicated vLLM server."
+            ),
+        ),
+    ] = None
 
     @property
     def resolved_name(self) -> str:
@@ -856,6 +882,31 @@ class OrchestratorConfig(BaseConfig):
             description="Whether to use the token-in-token-out (TITO) client for training across all environments. WARNING: Only use this if your environment has a linear history and the chat template has the extension property (i.e. no tokens are ever removed or inserted by the chat template)"
         ),
     ] = True
+
+    co_training: Annotated[
+        bool,
+        Field(
+            description=(
+                "Whether to co-train two agents simultaneously with separate LoRA adapters. "
+                "Requires exactly two environments (e.g. platform + user). "
+                "Creates run_<env_name> subdirectories under output_dir, one per agent. "
+                "The trainer must be configured with max_concurrent_runs=2."
+            ),
+        ),
+    ] = False
+
+    @model_validator(mode="after")
+    def validate_co_training(self):
+        if not self.co_training:
+            return self
+        if len(self.env) != 2:
+            raise ValueError(
+                f"co_training requires exactly 2 environments, got {len(self.env)}. "
+                "Configure one env per agent (e.g. platform and user)."
+            )
+        if self.ckpt is not None and self.ckpt.resume_step is not None:
+            raise ValueError("co_training does not support checkpoint resume (ckpt.resume_step must be unset).")
+        return self
 
     @model_validator(mode="after")
     def validate_unique_filter_types(self):

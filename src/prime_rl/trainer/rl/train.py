@@ -301,9 +301,26 @@ def train(config: TrainerConfig):
         forward_backward_start_time = time.perf_counter()
         seq_len = micro_batches[0]["input_ids"].shape[1]
 
-        # Normalize by the local number of unmasked tokens in the batch (per-batch length normalization)
-        loss_scale = sum(micro_batch["loss_mask"].sum().item() for micro_batch in micro_batches)
-        loss_scale = max(loss_scale, 1)
+        # Normalize by the number of unmasked tokens — per-run when co-training with LoRA so that
+        # each model is normalized by its own token count rather than the combined total.
+        # For single-model or non-LoRA training, all microbatches share the same global scale.
+        def _run_idx(mb) -> int | None:
+            """Return the LoRA run index for a microbatch, or None if not applicable."""
+            lnt = mb.get("lora_num_tokens")
+            if lnt is None:
+                return None
+            tokens = lnt.tolist() if hasattr(lnt, "tolist") else list(lnt)
+            for i, count in enumerate(tokens):
+                if count > 0:
+                    return i
+            return None
+
+        per_run_tokens: dict[int | None, int] = {}
+        for mb in micro_batches:
+            key = _run_idx(mb)
+            per_run_tokens[key] = per_run_tokens.get(key, 0) + mb["loss_mask"].sum().item()
+
+        per_microbatch_loss_scale = [max(per_run_tokens[_run_idx(mb)], 1) for mb in micro_batches]
 
         logger.debug(f"Starting forward and backward pass ({batch_size=})")
         tensors = Tensors()  # Used to accumulate tensor statistics across micro-batches and ranks for logging
@@ -313,6 +330,7 @@ def train(config: TrainerConfig):
         cp_size = parallel_dims.cp
 
         for micro_step, micro_batch in enumerate(micro_batches):
+            loss_scale = per_microbatch_loss_scale[micro_step]
             input_ids = micro_batch["input_ids"].to("cuda")
             position_ids = micro_batch["position_ids"].to("cuda")
             advantages = micro_batch["advantages"].to("cuda")

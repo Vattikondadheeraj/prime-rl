@@ -192,11 +192,15 @@ class MultiPacker(BasePacker):
                     return tokens
         return tokens
 
-    def _has_enough_tokens(self) -> bool:
-        """Check if we have enough samples in buffer to pack a step"""
-        # When not using small batch granularity, require at least one full batch
-        threshold = self.seq_len * self.dp_world_size
-        return self._count_tokens(threshold) >= threshold
+    def _all_runs_have_data(self) -> bool:
+        """Check if all active runs have at least one sample buffered for the current step."""
+        if not self.multi_run_manager.used_idxs:
+            return False
+        return all(
+            len(self.buffers[idx]) > 0
+            and self.buffers[idx][0][1] <= self.multi_run_manager.progress[idx].step
+            for idx in self.multi_run_manager.used_idxs
+        )
 
     def _select_samples_round_robin(self, token_budget: int) -> list[tuple[int, TrainingSample, int]]:
         """Select samples using round-robin from runs with buffered work."""
@@ -257,14 +261,11 @@ class MultiPacker(BasePacker):
         self._get_batch()
         start_time = time.time()
 
-        while not self._has_enough_tokens():
-            if time.time() - start_time > TIMEOUT_SECONDS and self._count_tokens() > 0:
-                self.logger.warning("Timeout waiting for enough tokens to pack")
-                break
+        while not self._all_runs_have_data():
             time.sleep(1)
             self._get_batch()
 
-        token_budget = self.seq_len * self.dp_world_size
+        token_budget = self._count_tokens()
         selected_samples = self._select_samples_round_robin(token_budget)
         assert selected_samples, "No samples selected"
 

@@ -5,6 +5,8 @@ import multiprocessing as mp
 import random
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Any
 
 import tomli_w
 
@@ -29,7 +31,7 @@ import pandas as pd
 import verifiers as vf
 from transformers import AutoProcessor, AutoTokenizer
 
-from prime_rl.configs.orchestrator import BufferConfig, OrchestratorConfig
+from prime_rl.configs.orchestrator import BufferConfig, LoRAConfig, OrchestratorConfig
 from prime_rl.orchestrator.buffer import Buffer
 from prime_rl.orchestrator.ckpt import Progress, setup_ckpt_manager
 from prime_rl.orchestrator.eval_utils import evaluate_env
@@ -93,8 +95,17 @@ async def orchestrate(config: OrchestratorConfig):
     # Save configs to output directory
     config_dir = config.output_dir / "control"
     config_dir.mkdir(parents=True, exist_ok=True)
-    with open(config_dir / "orch.toml", "wb") as f:
-        tomli_w.dump(config.model_dump(exclude_none=True, mode="json"), f)
+    if config.co_training:
+        # In co-training mode the main orchestrator (run_default) is a coordinator only —
+        # it does not write rollout data. Writing orch.toml here would cause the trainer's
+        # discover_runs() to register run_default as a training run, stealing one of the
+        # max_concurrent_runs slots and deadlocking _all_runs_have_data() forever.
+        # The actual training runs write their own orch.tomls below.
+        with open(config_dir / "coordinator.toml", "wb") as f:
+            tomli_w.dump(config.model_dump(exclude_none=True, mode="json"), f)
+    else:
+        with open(config_dir / "orch.toml", "wb") as f:
+            tomli_w.dump(config.model_dump(exclude_none=True, mode="json"), f)
 
     # Install environments
     env_ids_to_install = set()
@@ -345,6 +356,84 @@ async def orchestrate(config: OrchestratorConfig):
     logger.info(f"Initializing training batch sender ({config.rollout_transport})")
     training_batch_sender = setup_training_batch_sender(config.output_dir, config.rollout_transport)
 
+    # Co-training setup: create per-agent run dirs, schedulers, buffers, and senders.
+    # Each agent (e.g. "platform", "user") gets its own run_<name>/ subdir under output_dir,
+    # its own scheduler watching that subdir's broadcast dir, and its own batch sender.
+    # The trainer discovers these run dirs and trains two separate LoRA adapters.
+    if config.co_training:
+        co_env_names = [env.resolved_name for env in config.env]
+        co_run_dirs: dict[str, Path] = {}
+        co_senders: dict[str, Any] = {}
+        co_schedulers: dict[str, Scheduler] = {}
+        co_buffers: dict[str, Buffer] = {}
+        # Dedicated inference pools for agents that override client/model_name.
+        # Agents sharing the global inference_pool are NOT included here (no cleanup needed).
+        co_dedicated_pools: dict[str, Any] = {}
+
+        for env_cfg, env_name in zip(config.env, co_env_names):
+            # Run dirs must be siblings of run_default/ (i.e. directly under the trainer's
+            # output_dir) so the trainer's MultiRunManager can discover them via glob("run_*").
+            # The rl entrypoint sets orchestrator output_dir to LOG_DIR/run_default/, so we go
+            # one level up to place run_platform/ and run_user/ at LOG_DIR/run_platform/ etc.
+            run_dir = config.output_dir.parent / f"run_{env_name}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+
+            # Resolve per-agent model name and inference pool.
+            # When env_cfg.model_name or env_cfg.client is set, spin up a dedicated pool for
+            # this agent (two-model setup). Otherwise share the global inference pool.
+            agent_model_name = env_cfg.model_name or config.model.name
+            if env_cfg.client is not None or env_cfg.model_name is not None:
+                agent_client = env_cfg.client or config.client
+                agent_pool = await setup_inference_pool(agent_client, agent_model_name)
+                await agent_pool.wait_for_ready(agent_model_name)
+                co_dedicated_pools[env_name] = agent_pool
+                logger.info(f"Co-training [{env_name}]: dedicated inference pool for model '{agent_model_name}'")
+            else:
+                agent_pool = inference_pool
+
+            # Co-training always needs a named LoRA adapter per agent so vLLM keeps both
+            # adapters loaded simultaneously (e.g. "platform_lora" and "user_lora").
+            # If lora.name is explicitly set, prefix it; otherwise use "{env_name}_lora".
+            base_name = config.model.lora.name if config.model.lora else None
+            agent_lora_name = f"{env_name}_{base_name}" if base_name else f"{env_name}_lora"
+            if config.model.lora:
+                run_lora = config.model.lora.model_copy(update={"name": agent_lora_name})
+            else:
+                run_lora = LoRAConfig(name=agent_lora_name)
+            run_model = config.model.model_copy(update={"lora": run_lora, "name": agent_model_name})
+            run_config = config.model_copy(update={"output_dir": run_dir, "co_training": False, "model": run_model})
+            # Write orch.toml so the trainer's MultiRunManager discovers and configures this run.
+            run_control_dir = run_dir / "control"
+            run_control_dir.mkdir(parents=True, exist_ok=True)
+            with open(run_control_dir / "orch.toml", "wb") as f:
+                tomli_w.dump(run_config.model_dump(exclude_none=True, mode="json"), f)
+            co_run_dirs[env_name] = run_dir
+            co_senders[env_name] = setup_training_batch_sender(run_dir, config.rollout_transport)
+            # Per-run buffer: contains only this agent's examples.
+            env_dataset = train_dataset.filter(lambda ex, _n=env_name: ex["task"] == _n)
+            co_buffers[env_name] = Buffer(
+                env_dataset,
+                [env_name],
+                BufferConfig(
+                    seed=config.buffer.seed,
+                    online_difficulty_filtering=config.buffer.online_difficulty_filtering,
+                ),
+            )
+            co_schedulers[env_name] = Scheduler(
+                env=train_env_group,
+                buffer=co_buffers[env_name],
+                inference_pool=agent_pool,
+                max_inflight_rollouts=config.max_inflight_rollouts,
+                max_async_level=config.max_async_level,
+                max_off_policy_steps=config.max_off_policy_steps,
+                strict_async_level=config.strict_async_level,
+                tasks_per_minute=config.tasks_per_minute,
+                lora_name=agent_lora_name,
+                deferred_group_scoring_tasks=train_env_deferred_group_scoring_tasks & {env_name},
+                config=run_config,
+            )
+        logger.info(f"Co-training: created run dirs for {co_env_names}")
+
     # Track last online eval checkpoint step for this process
     last_eval_step = -1
     # Track previous ckpt_step to detect when ckpt_step jumps over eval interval boundaries
@@ -392,8 +481,12 @@ async def orchestrate(config: OrchestratorConfig):
             reason = evicted_path.read_text().strip()
             raise RuntimeError(f"Run evicted by trainer: {reason}")
 
-        # Capture ckpt_step once for consistency (it's updated inside the scheduler)
-        ckpt_step = scheduler.ckpt_step
+        # Capture ckpt_step once for consistency (it's updated inside the scheduler).
+        # In co-training, use the minimum across both schedulers so evals are only triggered
+        # once both agents have received updated weights from the trainer.
+        ckpt_step = (
+            min(sched.ckpt_step for sched in co_schedulers.values()) if config.co_training else scheduler.ckpt_step
+        )
 
         # Save checkpoint (if we are at an interval step and not at the first or last step)
         is_last_step = config.max_steps is not None and progress.step == config.max_steps - 1
@@ -438,20 +531,31 @@ async def orchestrate(config: OrchestratorConfig):
 
             # Pause weight updates and re-scheduling of training rollouts during eval
             # to avoid evaluating across different checkpoints and avoid congestion
-            scheduler.checkpoint_ready.clear()
+            if config.co_training:
+                for sched in co_schedulers.values():
+                    sched.checkpoint_ready.clear()
+            else:
+                scheduler.checkpoint_ready.clear()
 
             # For heavy eval workloads, it might be necessary additionally cancel in-flight training rollouts
             if config.eval.cancel_inflight_rollouts_on_eval:
                 logger.info("Cancelling in-flight training rollouts before starting evals to avoid congestion.")
-                await scheduler.cancel_inflight_rollouts()
+                if config.co_training:
+                    for sched in co_schedulers.values():
+                        await sched.cancel_inflight_rollouts()
+                else:
+                    await scheduler.cancel_inflight_rollouts()
 
+            _eval_model_name = (
+                next(iter(co_schedulers.values())).model_name if config.co_training else scheduler.model_name
+            )
             results = await asyncio.gather(
                 *[
                     evaluate_env(
                         env=eval_env,
                         env_name=eval_env_name,
                         get_client=inference_pool.get_next_client,
-                        model_name=scheduler.model_name,
+                        model_name=_eval_model_name,
                         sampling_args=eval_sampling_args,
                         num_examples=eval_env_config.num_examples or config.eval.num_examples,
                         rollouts_per_example=eval_env_config.rollouts_per_example or config.eval.rollouts_per_example,
@@ -464,7 +568,11 @@ async def orchestrate(config: OrchestratorConfig):
             )
 
             # Resume weight updates
-            scheduler.checkpoint_ready.set()
+            if config.co_training:
+                for sched in co_schedulers.values():
+                    sched.checkpoint_ready.set()
+            else:
+                scheduler.checkpoint_ready.set()
 
         # Update prev_ckpt_step for next iteration
         prev_ckpt_step = ckpt_step
@@ -472,17 +580,29 @@ async def orchestrate(config: OrchestratorConfig):
         # Schedule generating the training batch
         temperature = compute_temperature(progress.step, config.sampling, config.max_steps)
         sampling_args = get_sampling_args(config.sampling, temperature=temperature)
-        scheduler.set_sampling_args(sampling_args)
-        train_task = asyncio.create_task(scheduler.generate_batch(step=progress.step))
+        if config.co_training:
+            for sched in co_schedulers.values():
+                sched.set_sampling_args(sampling_args)
+            co_train_tasks = {
+                name: asyncio.create_task(sched.generate_batch(step=progress.step))
+                for name, sched in co_schedulers.items()
+            }
+            train_task = asyncio.gather(*co_train_tasks.values())
+        else:
+            scheduler.set_sampling_args(sampling_args)
+            train_task = asyncio.create_task(scheduler.generate_batch(step=progress.step))
 
         # Schedule running validation at the specified interval
         if val_buffer and config.val and progress.step % config.val.interval == 0:
             logger.info(f"Running validation for step {progress.step}")
             val_examples = val_buffer.sample_examples(config.val.num_examples)
+            _val_model_name = (
+                next(iter(co_schedulers.values())).model_name if config.co_training else scheduler.model_name
+            )
             val_task = asyncio.create_task(
                 generate(
                     env=train_env_group,
-                    model_name=scheduler.model_name,
+                    model_name=_val_model_name,
                     examples=val_examples,
                     rollouts_per_example=config.val.rollouts_per_example,
                     sampling_args=sampling_args,
@@ -495,8 +615,18 @@ async def orchestrate(config: OrchestratorConfig):
 
         # Await train rollouts, process results and write batch to disk to consume by trainer
         await train_task
-        generate_completions_time = scheduler.last_batch_generation_time
-        train_rollouts = train_task.result()
+        if config.co_training:
+            generate_completions_time = max(
+                sched.last_batch_generation_time for sched in co_schedulers.values()
+            )
+            co_train_rollouts: dict[str, list[vf.RolloutOutput]] = {
+                name: co_train_tasks[name].result() for name in co_schedulers
+            }
+            # Combine in stable order for metrics (platform first, then user)
+            train_rollouts = [r for rollouts in co_train_rollouts.values() for r in rollouts]
+        else:
+            generate_completions_time = scheduler.last_batch_generation_time
+            train_rollouts = train_task.result()
 
         # VLM: offload base64 images to disk immediately to free memory
         if is_vlm:
@@ -516,12 +646,24 @@ async def orchestrate(config: OrchestratorConfig):
         num_unique_examples = len(set(example_ids))
         rewards = [r["reward"] for r in train_rollouts]
         completion_lens = [get_completion_len(r) for r in train_rollouts]
-        advantages = compute_advantages(
-            rewards,
-            completion_lens,
-            config.rollouts_per_example,
-            config.advantage,
-        )
+        if config.co_training:
+            # Compute advantages per-agent to avoid cross-agent reward normalization.
+            # Each agent's rollouts are normalized independently, then concatenated.
+            advantages = []
+            for env_name in co_schedulers:
+                agent_rollouts = co_train_rollouts[env_name]
+                agent_rewards = [r["reward"] for r in agent_rollouts]
+                agent_lens = [get_completion_len(r) for r in agent_rollouts]
+                advantages.extend(
+                    compute_advantages(agent_rewards, agent_lens, config.rollouts_per_example, config.advantage)
+                )
+        else:
+            advantages = compute_advantages(
+                rewards,
+                completion_lens,
+                config.rollouts_per_example,
+                config.advantage,
+            )
 
         # Convert rollouts to training samples
         parallel_preprocess_start = time.perf_counter()
@@ -595,12 +737,25 @@ async def orchestrate(config: OrchestratorConfig):
             teacher_logprobs_time = time.perf_counter() - teacher_logprobs_start_time
             logger.debug(f"Computed teacher logprobs in {teacher_logprobs_time:.2f}s")
 
-        training_batch = TrainingBatch(
-            examples=train_examples,
-            step=progress.step,
-        )
-
-        training_batch_sender.send(training_batch)
+        if config.co_training:
+            # Split train_examples by agent (using rollout_samples_per_rollout to track boundaries)
+            # and send a separate TrainingBatch to each agent's run dir.
+            sample_offset = 0
+            rollout_offset = 0
+            for env_name in co_schedulers:
+                n_rollouts = len(co_train_rollouts[env_name])
+                n_samples = sum(rollout_samples_per_rollout[rollout_offset : rollout_offset + n_rollouts])
+                agent_examples = train_examples[sample_offset : sample_offset + n_samples]
+                co_senders[env_name].send(TrainingBatch(examples=agent_examples, step=progress.step))
+                sample_offset += n_samples
+                rollout_offset += n_rollouts
+            training_batch = None  # no single batch in co-training; set for uniform cleanup below
+        else:
+            training_batch = TrainingBatch(
+                examples=train_examples,
+                step=progress.step,
+            )
+            training_batch_sender.send(training_batch)
 
         # Await and process val results
         await val_task
@@ -720,10 +875,18 @@ async def orchestrate(config: OrchestratorConfig):
             "time/teacher_logprobs": teacher_logprobs_time,
             "time/save_ckpt": save_ckpt_time,
             "time/parallel_preprocess": parallel_preprocess_time,
-            # Scheduler metrics
-            **scheduler.get_metrics(),
-            # Buffer metrics
-            **buffer.get_metrics(),
+            # Scheduler metrics (use first co-scheduler when co-training)
+            **(
+                next(iter(co_schedulers.values())).get_metrics()
+                if config.co_training
+                else scheduler.get_metrics()
+            ),
+            # Buffer metrics (merge all co-buffers when co-training)
+            **(
+                {k: v for buf in co_buffers.values() for k, v in buf.get_metrics().items()}
+                if config.co_training
+                else buffer.get_metrics()
+            ),
             # Event loop lag metrics
             **event_loop_lag_monitor.get_metrics(),
             # Rollout filter metrics
@@ -797,7 +960,8 @@ async def orchestrate(config: OrchestratorConfig):
         # Flush all accumulated metrics for this step
         monitor.flush(step=progress.step)
 
-        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Reward: {results_df.reward.mean():.4f} |{f' Val. Reward: {val_results_df.reward.mean():.4f} |' if val_results_df is not None else ''} Throughput: {throughput:.1f} tokens/s | Seq. Length: {results_df.groupby('example_id').seq_len.mean().mean():.1f} tokens/sample | Async Level: {scheduler.async_level} | Max. Off-Policy Level: {scheduler.max_off_policy_level}"
+        _active_scheduler = next(iter(co_schedulers.values())) if config.co_training else scheduler
+        step_message = f"Step {progress.step} | Time: {step_time:.2f}s | Reward: {results_df.reward.mean():.4f} |{f' Val. Reward: {val_results_df.reward.mean():.4f} |' if val_results_df is not None else ''} Throughput: {throughput:.1f} tokens/s | Seq. Length: {results_df.groupby('example_id').seq_len.mean().mean():.1f} tokens/sample | Async Level: {_active_scheduler.async_level} | Max. Off-Policy Level: {_active_scheduler.max_off_policy_level}"
         logger.success(step_message)
 
         # Increment step
@@ -805,7 +969,9 @@ async def orchestrate(config: OrchestratorConfig):
         is_first_step = False
 
         # Free large per-step objects to prevent memory accumulation
-        del train_rollouts, train_examples, training_batch, vlm_cache
+        del train_rollouts, train_examples, vlm_cache
+        if training_batch is not None:
+            del training_batch
         del results_df, metrics_df, val_results_df
         gc.collect()
 
@@ -823,7 +989,11 @@ async def orchestrate(config: OrchestratorConfig):
                     env=eval_env,
                     env_name=eval_env_name,
                     get_client=inference_pool.get_next_client,
-                    model_name=scheduler.model_name,
+                    model_name=(
+                        next(iter(co_schedulers.values())).model_name
+                        if config.co_training
+                        else scheduler.model_name
+                    ),
                     sampling_args=eval_sampling_args,
                     num_examples=eval_env_config.num_examples or config.eval.num_examples,
                     rollouts_per_example=eval_env_config.rollouts_per_example or config.eval.rollouts_per_example,

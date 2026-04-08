@@ -42,6 +42,7 @@ class GroupState:
     rollouts_to_schedule: int
     completed_rollouts: list[vf.RolloutOutput] = field(default_factory=list)
     pinned_client: vf.ClientConfig | None = None
+    failed_rollouts: int = 0
 
 
 class Scheduler:
@@ -421,7 +422,16 @@ class Scheduler:
                             f"{rollout['error']['error_chain_repr']}"
                         )
                     if should_reschedule:
-                        group.rollouts_to_schedule += 1
+                        group.failed_rollouts += 1
+                        max_retries = self.max_retries_by_task.get(task, 0)
+                        if group.failed_rollouts > max_retries:
+                            self.logger.warning(
+                                f"Group {group_id} ({task}) exceeded max_retries={max_retries} "
+                                f"({group.failed_rollouts} failures) — dropping group"
+                            )
+                            await self.drop_group(group_id)
+                        else:
+                            group.rollouts_to_schedule += 1
                         continue
 
                     group.completed_rollouts.append(rollout)
