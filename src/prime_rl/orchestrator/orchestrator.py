@@ -875,9 +875,11 @@ async def orchestrate(config: OrchestratorConfig):
             "time/teacher_logprobs": teacher_logprobs_time,
             "time/save_ckpt": save_ckpt_time,
             "time/parallel_preprocess": parallel_preprocess_time,
-            # Scheduler metrics (use first co-scheduler when co-training)
+            # Scheduler metrics (prefix with agent name when co-training)
             **(
-                next(iter(co_schedulers.values())).get_metrics()
+                {f"scheduler/{name}/{k.split('/', 1)[-1] if '/' in k else k}": v
+                 for name, sched in co_schedulers.items()
+                 for k, v in sched.get_metrics().items()}
                 if config.co_training
                 else scheduler.get_metrics()
             ),
